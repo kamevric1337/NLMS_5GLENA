@@ -4,6 +4,7 @@
 #include "ns3/core-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/internet-module.h"
+#include "ns3/internet-apps-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/nr-module.h"
@@ -20,6 +21,18 @@ NS_LOG_COMPONENT_DEFINE("NrHandover3Gnb");
 static uint32_t g_hoStartCount = 0;
 static uint32_t g_hoEndOkCount = 0;
 static uint32_t g_hoEndErrorCount = 0;
+
+static Time g_rttSumThisInterval = Seconds(0);
+static uint32_t g_rttCountThisInterval = 0;
+static Time g_lastRtt = Seconds(0);
+
+static void
+NotifyPingRtt(uint16_t /*seq*/, Time rtt)
+{
+    g_lastRtt = rtt;
+    g_rttSumThisInterval += rtt;
+    ++g_rttCountThisInterval;
+}
 
 static void
 NotifyHandoverStart(uint64_t imsi, uint16_t sourceCellId, uint16_t rnti, uint16_t targetCellId)
@@ -48,6 +61,66 @@ NotifyHandoverEndError(uint64_t imsi, uint16_t cellId, uint16_t rnti)
               << std::endl;
 }
 
+static void
+PrintIntervalStats(Time interval,
+                   Time startTime,
+                   Time stopTime,
+                   const Ptr<PacketSink>& dlSink,
+                   uint64_t* lastRxBytes)
+{
+    const Time now = Simulator::Now();
+    if (now < startTime)
+    {
+        Simulator::Schedule(interval,
+                            &PrintIntervalStats,
+                            interval,
+                            startTime,
+                            stopTime,
+                            dlSink,
+                            lastRxBytes);
+        return;
+    }
+
+    const uint64_t rxBytesNow = dlSink->GetTotalRx();
+    const uint64_t deltaBytes = rxBytesNow - *lastRxBytes;
+    *lastRxBytes = rxBytesNow;
+
+    const double intervalSeconds = interval.GetSeconds();
+    const double thrMbps = (deltaBytes * 8.0) / intervalSeconds / 1e6;
+
+    double rttAvgMs = -1.0;
+    if (g_rttCountThisInterval > 0)
+    {
+        rttAvgMs = (g_rttSumThisInterval.GetSeconds() * 1000.0) / g_rttCountThisInterval;
+    }
+
+    std::cout << std::fixed << std::setprecision(3) << now.GetSeconds() << "s"
+              << " interval_throughput=" << thrMbps << " Mbps";
+    if (rttAvgMs >= 0.0)
+    {
+        std::cout << " interval_rtt_avg=" << rttAvgMs << " ms";
+    }
+    else
+    {
+        std::cout << " interval_rtt_avg=N/A";
+    }
+    std::cout << " (last_rtt=" << g_lastRtt.GetMilliSeconds() << " ms)" << std::endl;
+
+    g_rttSumThisInterval = Seconds(0);
+    g_rttCountThisInterval = 0;
+
+    if (now + interval <= stopTime)
+    {
+        Simulator::Schedule(interval,
+                            &PrintIntervalStats,
+                            interval,
+                            startTime,
+                            stopTime,
+                            dlSink,
+                            lastRxBytes);
+    }
+}
+
 int
 main(int argc, char* argv[])
 {
@@ -67,7 +140,11 @@ main(int argc, char* argv[])
     uint32_t udpPacketSize = 1200;
     double udpRateMbps = 50.0;
 
+    Time statsInterval = Seconds(1.0);
+
     bool useIdealRrc = true;
+
+    bool enableHarqRetx = false;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simTime", "Total simulation time", simTime);
@@ -76,6 +153,10 @@ main(int argc, char* argv[])
     cmd.AddValue("ueSpeed", "UE speed (m/s)", ueSpeedMps);
     cmd.AddValue("udpRateMbps", "DL offered rate (Mbps)", udpRateMbps);
     cmd.AddValue("useIdealRrc", "Use ideal RRC (recommended for demo)", useIdealRrc);
+    cmd.AddValue("statsInterval", "Interval for printing RTT/throughput stats", statsInterval);
+    cmd.AddValue("enableHarqRetx",
+                 "Enable NR HARQ retransmissions (may impact stability with UL traffic)",
+                 enableHarqRetx);
     cmd.Parse(argc, argv);
 
     Config::SetDefault("ns3::NrGnbPhy::TxPower", DoubleValue(30));
@@ -115,6 +196,9 @@ main(int argc, char* argv[])
     nrHelper->SetEpcHelper(epcHelper);
     nrHelper->SetBeamformingHelper(beamformingHelper);
     nrHelper->SetAttribute("UseIdealRrc", BooleanValue(useIdealRrc));
+
+    // UL traffic (e.g., Ping) can exercise HARQ; keep it off by default for stability.
+    nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(enableHarqRetx));
 
     // Automatic handover based on A3 RSRP.
     nrHelper->SetHandoverAlgorithmType("ns3::NrA3RsrpHandoverAlgorithm");
@@ -160,7 +244,7 @@ main(int argc, char* argv[])
     Ipv4AddressHelper ipv4h;
     ipv4h.SetBase("1.0.0.0", "255.0.0.0");
     Ipv4InterfaceContainer internetIpIfaces = ipv4h.Assign(internetDevices);
-    (void)internetIpIfaces.GetAddress(1);
+    Ipv4Address remoteHostAddr = internetIpIfaces.GetAddress(1);
 
     Ipv4StaticRoutingHelper ipv4RoutingHelper;
     Ptr<Ipv4StaticRouting> remoteHostStaticRouting =
@@ -198,10 +282,30 @@ main(int argc, char* argv[])
     client.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
     ApplicationContainer clientApps = client.Install(remoteHost);
 
+    // RTT measurement: ICMP ping UE -> RemoteHost.
+    PingHelper pingHelper(remoteHostAddr);
+    pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::VerboseMode::SILENT));
+    pingHelper.SetAttribute("Interval", TimeValue(MilliSeconds(200)));
+    pingHelper.SetAttribute("Size", UintegerValue(64));
+    pingHelper.SetAttribute("Count", UintegerValue(0)); // unlimited
+    ApplicationContainer pingApps = pingHelper.Install(ueNodes.Get(0));
+
     sinkApps.Start(appStartTime);
     clientApps.Start(appStartTime);
+    pingApps.Start(appStartTime);
     sinkApps.Stop(simTime);
     clientApps.Stop(simTime);
+    pingApps.Stop(simTime);
+
+    // Periodic RTT + throughput printing.
+    uint64_t lastRxBytes = 0;
+    Simulator::Schedule(appStartTime,
+                        &PrintIntervalStats,
+                        statsInterval,
+                        appStartTime,
+                        simTime,
+                        dlSink,
+                        &lastRxBytes);
 
     // Hook UE RRC handover traces.
     {
@@ -210,6 +314,12 @@ main(int argc, char* argv[])
         ueRrc->TraceConnectWithoutContext("HandoverStart", MakeCallback(&NotifyHandoverStart));
         ueRrc->TraceConnectWithoutContext("HandoverEndOk", MakeCallback(&NotifyHandoverEndOk));
         ueRrc->TraceConnectWithoutContext("HandoverEndError", MakeCallback(&NotifyHandoverEndError));
+    }
+
+    // Hook Ping RTT trace.
+    {
+        Ptr<Ping> ping = pingApps.Get(0)->GetObject<Ping>();
+        ping->TraceConnectWithoutContext("Rtt", MakeCallback(&NotifyPingRtt));
     }
 
     Simulator::Stop(simTime);
