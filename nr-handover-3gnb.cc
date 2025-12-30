@@ -51,7 +51,9 @@ NotifyHandoverEndError(uint64_t imsi, uint16_t cellId, uint16_t rnti)
 int
 main(int argc, char* argv[])
 {
-    Time simTime = Seconds(12.0);
+    // Defaults chosen so the UE traverses all 3 gNBs (and triggers 2 HOs)
+    // with the default gNB spacing and UE speed.
+    Time simTime = Seconds(35.0);
     Time appStartTime = Seconds(0.5);
 
     double gnbDistanceMeters = 200.0;
@@ -60,7 +62,7 @@ main(int argc, char* argv[])
 
     double centralFrequency = 2.8e9;
     double bandwidth = 20e6;
-    uint16_t numerology = 1;
+    uint8_t numerology = 1;
 
     uint32_t udpPacketSize = 1200;
     double udpRateMbps = 50.0;
@@ -158,7 +160,7 @@ main(int argc, char* argv[])
     Ipv4AddressHelper ipv4h;
     ipv4h.SetBase("1.0.0.0", "255.0.0.0");
     Ipv4InterfaceContainer internetIpIfaces = ipv4h.Assign(internetDevices);
-    Ipv4Address remoteHostAddr = internetIpIfaces.GetAddress(1);
+    (void)internetIpIfaces.GetAddress(1);
 
     Ipv4StaticRoutingHelper ipv4RoutingHelper;
     Ptr<Ipv4StaticRouting> remoteHostStaticRouting =
@@ -227,11 +229,27 @@ main(int argc, char* argv[])
 
     Simulator::Destroy();
 
-    // Expecting 2 handovers for a 3-gNB line traversal.
-    if (g_hoEndOkCount < 2)
+    // Expected handovers depend on whether the UE has enough time to reach the
+    // midpoints between gNB0-gNB1 and gNB1-gNB2.
+    uint32_t expectedHo = 0;
+    if (ueSpeedMps > 0.0)
     {
-        std::cerr << "WARNING: Expected at least 2 successful handovers, got " << g_hoEndOkCount
-                  << std::endl;
+        const double tMid01 = (gnbDistanceMeters / 2.0 - ueStartX) / ueSpeedMps;
+        const double tMid12 = (3.0 * gnbDistanceMeters / 2.0 - ueStartX) / ueSpeedMps;
+        if (simTime.GetSeconds() > tMid01)
+        {
+            ++expectedHo;
+        }
+        if (simTime.GetSeconds() > tMid12)
+        {
+            ++expectedHo;
+        }
+    }
+
+    if (g_hoEndOkCount < expectedHo)
+    {
+        std::cerr << "WARNING: Expected at least " << expectedHo
+                  << " successful handovers, got " << g_hoEndOkCount << std::endl;
         return 1;
     }
 
