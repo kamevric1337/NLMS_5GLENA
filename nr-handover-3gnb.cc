@@ -4,13 +4,13 @@
 #include "ns3/core-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/internet-module.h"
-#include "ns3/internet-apps-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/nr-module.h"
 #include "ns3/point-to-point-module.h"
 
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 
@@ -25,13 +25,36 @@ static uint32_t g_hoEndErrorCount = 0;
 static Time g_rttSumThisInterval = Seconds(0);
 static uint32_t g_rttCountThisInterval = 0;
 static Time g_lastRtt = Seconds(0);
+static std::ofstream* g_rttCsv = nullptr;
+static uint32_t g_lastCwndBytes = 0;
+static std::ofstream* g_cwndCsv = nullptr;
 
 static void
-NotifyPingRtt(uint16_t /*seq*/, Time rtt)
+NotifyTcpLastRtt(Time /*oldValue*/, Time newValue)
 {
-    g_lastRtt = rtt;
-    g_rttSumThisInterval += rtt;
+    if (newValue.IsZero())
+    {
+        return;
+    }
+    g_lastRtt = newValue;
+    g_rttSumThisInterval += newValue;
     ++g_rttCountThisInterval;
+    if (g_rttCsv && g_rttCsv->is_open())
+    {
+        (*g_rttCsv) << std::fixed << std::setprecision(6) << Simulator::Now().GetSeconds() << ","
+                   << newValue.GetSeconds() * 1000.0 << "\n";
+    }
+}
+
+static void
+NotifyTcpCwnd(uint32_t /*oldValue*/, uint32_t newValue)
+{
+    g_lastCwndBytes = newValue;
+    if (g_cwndCsv && g_cwndCsv->is_open())
+    {
+        (*g_cwndCsv) << std::fixed << std::setprecision(6) << Simulator::Now().GetSeconds() << ","
+                    << newValue << "\n";
+    }
 }
 
 static void
@@ -104,7 +127,8 @@ PrintIntervalStats(Time interval,
     {
         std::cout << " interval_rtt_avg=N/A";
     }
-    std::cout << " (last_rtt=" << g_lastRtt.GetMilliSeconds() << " ms)" << std::endl;
+    std::cout << " (last_rtt=" << g_lastRtt.GetMilliSeconds() << " ms"
+              << ", last_cwnd=" << g_lastCwndBytes << " bytes)" << std::endl;
 
     g_rttSumThisInterval = Seconds(0);
     g_rttCountThisInterval = 0;
@@ -137,8 +161,9 @@ main(int argc, char* argv[])
     double bandwidth = 20e6;
     uint8_t numerology = 1;
 
-    uint32_t udpPacketSize = 1200;
-    double udpRateMbps = 50.0;
+    // TCP traffic parameters.
+    uint32_t tcpSendSize = 1448;
+    uint16_t tcpPort = 50000;
 
     Time statsInterval = Seconds(1.0);
 
@@ -151,13 +176,33 @@ main(int argc, char* argv[])
     cmd.AddValue("appStartTime", "UDP app start time", appStartTime);
     cmd.AddValue("gnbDistance", "Distance between adjacent gNBs (m)", gnbDistanceMeters);
     cmd.AddValue("ueSpeed", "UE speed (m/s)", ueSpeedMps);
-    cmd.AddValue("udpRateMbps", "DL offered rate (Mbps)", udpRateMbps);
+    std::string tcpVariant = "ns3::TcpVegas";
+    std::string rttCsvPath = "tcp-rtt-samples.csv";
+    std::string cwndCsvPath = "tcp-cwnd-samples.csv";
+
+    cmd.AddValue("tcpVariant",
+                 "TCP congestion control TypeId name (e.g., ns3::TcpVegas, ns3::TcpCubic)",
+                 tcpVariant);
+    cmd.AddValue("tcpSendSize", "TCP send size (bytes)", tcpSendSize);
+    cmd.AddValue("tcpPort", "TCP destination port on UE", tcpPort);
     cmd.AddValue("useIdealRrc", "Use ideal RRC (recommended for demo)", useIdealRrc);
     cmd.AddValue("statsInterval", "Interval for printing RTT/throughput stats", statsInterval);
     cmd.AddValue("enableHarqRetx",
                  "Enable NR HARQ retransmissions (may impact stability with UL traffic)",
                  enableHarqRetx);
+    cmd.AddValue("rttCsv", "CSV output path for per-sample TCP RTT (time_s,rtt_ms)", rttCsvPath);
+    cmd.AddValue("cwndCsv", "CSV output path for per-sample TCP cwnd (time_s,cwnd_bytes)", cwndCsvPath);
     cmd.Parse(argc, argv);
+
+    // Use a TCP CC algorithm that is sensitive to RTT (Vegas by default).
+    {
+        const TypeId tcpTid = TypeId::LookupByName(tcpVariant);
+        Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(tcpTid));
+    }
+
+    // Avoid artificial throughput limiting due to small socket buffers.
+    Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(1 << 20));
+    Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(1 << 20));
 
     Config::SetDefault("ns3::NrGnbPhy::TxPower", DoubleValue(30));
     Config::SetDefault("ns3::NrUePhy::TxPower", DoubleValue(23));
@@ -244,7 +289,7 @@ main(int argc, char* argv[])
     Ipv4AddressHelper ipv4h;
     ipv4h.SetBase("1.0.0.0", "255.0.0.0");
     Ipv4InterfaceContainer internetIpIfaces = ipv4h.Assign(internetDevices);
-    Ipv4Address remoteHostAddr = internetIpIfaces.GetAddress(1);
+    // Remote host IP is available as internetIpIfaces.GetAddress(1) if needed.
 
     Ipv4StaticRoutingHelper ipv4RoutingHelper;
     Ptr<Ipv4StaticRouting> remoteHostStaticRouting =
@@ -264,38 +309,22 @@ main(int argc, char* argv[])
         ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
     }
 
-    // DL traffic: RemoteHost -> UE.
-    uint16_t dlPort = 1234;
-
-    PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
-                                InetSocketAddress(Ipv4Address::GetAny(), dlPort));
+    // DL traffic: RemoteHost -> UE (TCP).
+    PacketSinkHelper sinkHelper("ns3::TcpSocketFactory",
+                                InetSocketAddress(Ipv4Address::GetAny(), tcpPort));
     ApplicationContainer sinkApps = sinkHelper.Install(ueNodes.Get(0));
     Ptr<PacketSink> dlSink = sinkApps.Get(0)->GetObject<PacketSink>();
 
-    // Convert Mbps -> packet interval.
-    double udpRateBps = udpRateMbps * 1e6;
-    double pktIntervalSeconds = (udpPacketSize * 8.0) / udpRateBps;
-
-    UdpClientHelper client(ueIpIfaces.GetAddress(0), dlPort);
-    client.SetAttribute("PacketSize", UintegerValue(udpPacketSize));
-    client.SetAttribute("Interval", TimeValue(Seconds(pktIntervalSeconds)));
-    client.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
-    ApplicationContainer clientApps = client.Install(remoteHost);
-
-    // RTT measurement: ICMP ping UE -> RemoteHost.
-    PingHelper pingHelper(remoteHostAddr);
-    pingHelper.SetAttribute("VerboseMode", EnumValue(Ping::VerboseMode::SILENT));
-    pingHelper.SetAttribute("Interval", TimeValue(MilliSeconds(200)));
-    pingHelper.SetAttribute("Size", UintegerValue(64));
-    pingHelper.SetAttribute("Count", UintegerValue(0)); // unlimited
-    ApplicationContainer pingApps = pingHelper.Install(ueNodes.Get(0));
+    BulkSendHelper bulkHelper("ns3::TcpSocketFactory",
+                              InetSocketAddress(ueIpIfaces.GetAddress(0), tcpPort));
+    bulkHelper.SetAttribute("MaxBytes", UintegerValue(0));
+    bulkHelper.SetAttribute("SendSize", UintegerValue(tcpSendSize));
+    ApplicationContainer clientApps = bulkHelper.Install(remoteHost);
 
     sinkApps.Start(appStartTime);
     clientApps.Start(appStartTime);
-    pingApps.Start(appStartTime);
     sinkApps.Stop(simTime);
     clientApps.Stop(simTime);
-    pingApps.Stop(simTime);
 
     // Periodic RTT + throughput printing.
     uint64_t lastRxBytes = 0;
@@ -316,11 +345,46 @@ main(int argc, char* argv[])
         ueRrc->TraceConnectWithoutContext("HandoverEndError", MakeCallback(&NotifyHandoverEndError));
     }
 
-    // Hook Ping RTT trace.
+    // Open per-sample RTT CSV and hook TCP RTT trace after the BulkSend socket exists.
+    std::ofstream rttCsv;
+    std::ofstream cwndCsv;
+    if (!rttCsvPath.empty())
     {
-        Ptr<Ping> ping = pingApps.Get(0)->GetObject<Ping>();
-        ping->TraceConnectWithoutContext("Rtt", MakeCallback(&NotifyPingRtt));
+        rttCsv.open(rttCsvPath.c_str(), std::ofstream::out | std::ofstream::trunc);
+        if (rttCsv.is_open())
+        {
+            rttCsv << "time_s,rtt_ms\n";
+            g_rttCsv = &rttCsv;
+        }
     }
+
+    if (!cwndCsvPath.empty())
+    {
+        cwndCsv.open(cwndCsvPath.c_str(), std::ofstream::out | std::ofstream::trunc);
+        if (cwndCsv.is_open())
+        {
+            cwndCsv << "time_s,cwnd_bytes\n";
+            g_cwndCsv = &cwndCsv;
+        }
+    }
+
+    Simulator::Schedule(appStartTime + MilliSeconds(1),
+                        [app = clientApps.Get(0)]() {
+                            Ptr<BulkSendApplication> bulk = app->GetObject<BulkSendApplication>();
+                            if (!bulk)
+                            {
+                                return;
+                            }
+                            Ptr<Socket> s = bulk->GetSocket();
+                            Ptr<TcpSocketBase> tcp = DynamicCast<TcpSocketBase>(s);
+                            if (tcp)
+                            {
+                                tcp->TraceConnectWithoutContext("LastRTT",
+                                                               MakeCallback(&NotifyTcpLastRtt));
+                                tcp->TraceConnectWithoutContext("CongestionWindow",
+                                                               MakeCallback(&NotifyTcpCwnd));
+                            }
+                        });
 
     Simulator::Stop(simTime);
     Simulator::Run();
@@ -338,6 +402,15 @@ main(int argc, char* argv[])
               << " Mbps\n";
 
     Simulator::Destroy();
+
+    if (rttCsv.is_open())
+    {
+        rttCsv.close();
+    }
+    if (cwndCsv.is_open())
+    {
+        cwndCsv.close();
+    }
 
     // Expected handovers depend on whether the UE has enough time to reach the
     // midpoints between gNB0-gNB1 and gNB1-gNB2.
